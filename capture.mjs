@@ -47,7 +47,7 @@ async function loadLazyContent(page) {
       .filter((i) => i.checkVisibility())
       .every((i) => i.complete),
     null, { timeout: 15000 },
-  ).catch(() => console.warn('Warning: some images did not finish loading'));
+  ).catch(() => warn('Warning: some images did not finish loading'));
 
   await page.evaluate(() => {
     for (const el of document.querySelectorAll('*')) {
@@ -99,8 +99,38 @@ async function collectElements(page, prefix) {
 }
 
 await mkdir('output', { recursive: true });
+// Animated status line, so you can see the capture is still working
+let spinner;
+function clearLine() {
+  if (process.stdout.isTTY) process.stdout.write('\r\x1b[K');
+}
+function stopStatus() {
+  clearInterval(spinner);
+  clearLine();
+}
+function status(text) {
+  stopStatus();
+  if (!process.stdout.isTTY) return console.log(`${text}...`);
+  const frames = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏';
+  const start = Date.now();
+  let i = 0;
+  const draw = () => {
+    clearLine();
+    const seconds = Math.floor((Date.now() - start) / 1000);
+    process.stdout.write(`${frames[i++ % frames.length]} ${text}... ${seconds}s`);
+  };
+  draw();
+  spinner = setInterval(draw, 100);
+}
+function warn(message) {
+  clearLine();
+  console.warn(message);
+}
+
 // Add --headed to watch the browser; maps sometimes render only this way
 const headless = !process.argv.includes('--headed');
+
+status('Starting browser');
 
 // Installed Google Chrome plays more video formats (such as H.264) than bundled Chromium
 const browser = await chromium.launch({ channel: 'chrome', headless })
@@ -113,7 +143,7 @@ async function waitForVideos(page) {
       .filter((v) => v.checkVisibility())
       .every((v) => v.readyState >= 3 && (!v.autoplay || v.currentTime > 0.5)),
     null, { timeout: 15000 },
-  ).catch(() => console.warn('Warning: a video did not load in time'));
+  ).catch(() => warn('Warning: a video did not load in time'));
 }
 
 try {
@@ -132,22 +162,26 @@ try {
       }
     });
 
+    status(`${name}: loading page`);
     await page.goto(url, { waitUntil: 'load', timeout: 45000 });
     await page.waitForTimeout(5000);
 
     if (challenged) {
-      console.warn(`Skipped ${name}: blocked by a security check, so it can't be audited`);
+      warn(`Skipped ${name}: blocked by a security check, so it can't be audited`);
       await context.close();
       continue;
     }
 
+    status(`${name}: waiting for videos`);
     await waitForVideos(page);
 
     // First screen only: what visitors see before scrolling
     await page.screenshot({ path: `output/${name}-fold.png` });
 
+    status(`${name}: scrolling to load content`);
     // Visit the whole page so lazy images load, then return to the top
     await loadLazyContent(page);
+    status(`${name}: taking full-page screenshot`);
     // Chrome repeats content in screenshots taller than about 16,000 pixels
     const tooTall = await page.evaluate(
       () => document.documentElement.scrollHeight * window.devicePixelRatio > 16000,
@@ -161,6 +195,7 @@ try {
     // Record where elements are, matching the full-page screenshot just taken
     const layout = await collectElements(page, name[0]);
 
+    status(`${name}: capturing maps and saving data`);
     // Separate close-up of each map, taken while it is on screen
     const maps = page.locator(
       'iframe[src*="google.com/maps"]:visible, iframe[src*="maps.google."]:visible',
@@ -171,7 +206,7 @@ try {
         await page.waitForTimeout(3000);
         await map.screenshot({ path: `output/${name}-map-${i + 1}.png`, timeout: 10000 });
       } catch {
-        console.warn(`Warning: could not capture map ${i + 1}`);
+        warn(`Warning: could not capture map ${i + 1}`);
       }
     }
     await page.evaluate(() => window.scrollTo({ top: 0, behavior: 'instant' }));
@@ -197,9 +232,11 @@ try {
       `output/${name}.json`,
       JSON.stringify({ url, capturedAt, ...data, ...layout }, null, 2),
     );
-    console.log(`Captured ${name}`);
+    stopStatus();
+    console.log(`✓ Captured ${name}`);
     await context.close();
   }
 } finally {
+  stopStatus();
   await browser.close();
 }
