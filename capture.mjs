@@ -9,7 +9,8 @@ if (!url) {
 
 const views = {
   desktop: { viewport: { width: 1440, height: 900 } },
-  mobile: devices['iPhone 13'],
+  // 2x keeps long mobile screenshots under Chrome's height limit
+  mobile: { ...devices['iPhone 13'], deviceScaleFactor: 2 },
 };
 
 // Scroll in small steps, bring each image into view, and wait for it to load
@@ -55,6 +56,46 @@ async function loadLazyContent(page) {
     window.scrollTo({ top: 0, behavior: 'instant' });
   });
   await page.waitForTimeout(1500);
+}
+
+// List visible elements with an ID and position, so findings can point to them
+async function collectElements(page, prefix) {
+  return page.evaluate((idPrefix) => {
+    const clean = (s) => (s || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+    const pageWidth = document.documentElement.scrollWidth;
+    const selector = 'header, nav, section, footer, form, h1, h2, h3, h4, p, li, '
+      + 'a[href], button, [role="button"], label, input:not([type="hidden"]), '
+      + 'textarea, select, img, video, iframe';
+    const elements = [];
+
+    for (const el of document.querySelectorAll(selector)) {
+      if (elements.length >= 300) break;
+      if (!el.checkVisibility({ visibilityProperty: true, opacityProperty: true })) continue;
+      const r = el.getBoundingClientRect();
+      const x = r.left + window.scrollX;
+      const y = r.top + window.scrollY;
+      // Skip tiny items and off-screen carousel slides
+      if (r.width < 8 || r.height < 8 || x + r.width <= 0 || x >= pageWidth) continue;
+
+      const isBlock = el.matches('header, nav, section, footer, form');
+      const label = el.getAttribute('aria-label') || el.getAttribute('alt')
+        || el.getAttribute('placeholder')
+        || (isBlock ? el.querySelector('h1, h2, h3')?.innerText || el.id : el.innerText);
+
+      elements.push({
+        id: `${idPrefix}${elements.length + 1}`,
+        tag: el.tagName.toLowerCase(),
+        text: clean(label),
+        box: {
+          x: Math.round(x),
+          y: Math.round(y),
+          width: Math.round(r.width),
+          height: Math.round(r.height),
+        },
+      });
+    }
+    return { pageWidth, elements };
+  }, prefix);
 }
 
 await mkdir('output', { recursive: true });
@@ -107,7 +148,18 @@ try {
 
     // Visit the whole page so lazy images load, then return to the top
     await loadLazyContent(page);
-    await page.screenshot({ path: `output/${name}-full.png`, fullPage: true });
+    // Chrome repeats content in screenshots taller than about 16,000 pixels
+    const tooTall = await page.evaluate(
+      () => document.documentElement.scrollHeight * window.devicePixelRatio > 16000,
+    );
+    await page.screenshot({
+      path: `output/${name}-full.png`,
+      fullPage: true,
+      scale: tooTall ? 'css' : 'device',
+    });
+
+    // Record where elements are, matching the full-page screenshot just taken
+    const layout = await collectElements(page, name[0]);
 
     // Separate close-up of each map, taken while it is on screen
     const maps = page.locator(
@@ -140,7 +192,11 @@ try {
       };
     });
 
-    await writeFile(`output/${name}.json`, JSON.stringify({ url, ...data }, null, 2));
+    const capturedAt = new Date().toISOString();
+    await writeFile(
+      `output/${name}.json`,
+      JSON.stringify({ url, capturedAt, ...data, ...layout }, null, 2),
+    );
     console.log(`Captured ${name}`);
     await context.close();
   }

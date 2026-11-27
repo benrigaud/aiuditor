@@ -20,6 +20,89 @@ async function embed(path, width) {
   }
 }
 
+// Cut the area around one element out of the full screenshot and outline it
+async function cropElement(view, box, pageWidth) {
+  const path = `output/${view}-full.png`;
+  const image = await sharp(path).metadata();
+  const scale = image.width / pageWidth;
+
+  // Show some surroundings: at least 640 px wide on desktop, full width on mobile
+  const width = Math.min(pageWidth, Math.max(box.width + 80, view === 'desktop' ? 640 : pageWidth));
+  const height = Math.min(Math.max(box.height + 80, 260), 900);
+  const left = Math.max(0, Math.min(box.x + box.width / 2 - width / 2, pageWidth - width));
+  const top = Math.max(0, box.height + 80 > height ? box.y - 40 : box.y + box.height / 2 - height / 2);
+
+  const area = {
+    left: Math.round(left * scale),
+    top: Math.round(top * scale),
+    width: Math.round(width * scale),
+    height: Math.round(height * scale),
+  };
+  area.width = Math.min(area.width, image.width - area.left);
+  area.height = Math.min(area.height, image.height - area.top);
+  if (area.width < 1 || area.height < 1) return null;
+
+  // Outline, kept inside the crop
+  const x1 = Math.max(3, (box.x - left) * scale - 6);
+  const y1 = Math.max(3, (box.y - top) * scale - 6);
+  const x2 = Math.min(area.width - 3, (box.x - left + box.width) * scale + 6);
+  const y2 = Math.min(area.height - 3, (box.y - top + box.height) * scale + 6);
+  if (x2 <= x1 || y2 <= y1) return null;
+
+  const outline = Buffer.from(
+    `<svg width="${area.width}" height="${area.height}">
+      <rect x="${x1}" y="${y1}" width="${x2 - x1}" height="${y2 - y1}" rx="8"
+        fill="none" stroke="#e7000b" stroke-width="${Math.max(3, Math.round(2 * scale))}"/>
+    </svg>`,
+  );
+  const marked = await sharp(path)
+    .extract(area)
+    .composite([{ input: outline, top: 0, left: 0 }])
+    .png()
+    .toBuffer();
+  const jpeg = await sharp(marked)
+    .resize({ width: view === 'desktop' ? 1200 : 600, withoutEnlargement: true })
+    .jpeg({ quality: 80 })
+    .toBuffer();
+  return `data:image/jpeg;base64,${jpeg.toString('base64')}`;
+}
+
+// Add a crop to each finding that points to an element from the matching capture
+async function addCrops(report) {
+  for (const view of ['desktop', 'mobile']) {
+    let data;
+    try {
+      data = JSON.parse(await readFile(`output/${view}.json`, 'utf8'));
+    } catch {
+      continue;
+    }
+    if (!report.captures || data.url !== report.url || data.capturedAt !== report.captures[view]) {
+      console.warn(`No ${view} crops: run review.mjs again after capturing`);
+      continue;
+    }
+    for (const f of report.findings) {
+      if (f.status === 'pass') continue;
+      const element = data.elements.find((el) => el.id === f.element);
+      if (!element) continue;
+      try {
+        f.crop = await cropElement(view, element.box, data.pageWidth);
+        f.cropView = view;
+      } catch (error) {
+        console.warn(`Warning: no crop for check ${f.check}: ${error.message}`);
+      }
+    }
+  }
+}
+
+const figure = (f) => {
+  if (!f.crop) return '';
+  const label = f.elementRole === 'context' ? 'Related area' : 'Highlighted area';
+  return `<figure class="crop ${f.cropView}">
+      <img src="${f.crop}" alt="${label} on ${f.cropView} for check ${escapeHtml(f.check)}">
+      <figcaption>${label} · ${f.cropView}</figcaption>
+    </figure>`;
+};
+
 const card = (f) => `
   <article class="card ${escapeHtml(f.severity)}" data-severity="${escapeHtml(f.severity)}">
     <p class="meta">
@@ -27,6 +110,7 @@ const card = (f) => `
       Check ${escapeHtml(f.check)} · ${escapeHtml(f.view)}
     </p>
     <h3>${escapeHtml(f.checkText)}</h3>
+    ${figure(f)}
     <h4>What we saw</h4>
     <p>${escapeHtml(f.evidence)}</p>
     <h4>${f.status === 'unclear' ? 'How to test' : 'Suggested fix'}</h4>
@@ -36,6 +120,8 @@ const card = (f) => `
 async function main() {
   const report = JSON.parse(await readFile('output/findings.json', 'utf8'));
   const capture = JSON.parse(await readFile('output/desktop.json', 'utf8'));
+
+  await addCrops(report);
 
   const order = { high: 0, medium: 1, low: 2, none: 3 };
   const byStatus = (status) => report.findings
@@ -116,7 +202,7 @@ async function main() {
   p { margin: 4px 0; }
   .meta, figcaption, .card h4 + p { color: var(--muted-foreground); }
   .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin: 24px 0; }
-  .stat, .card { background: var(--card); border: 1px solid var(--border); border-radius: calc(var(--radius) + 4px); box-shadow: var(--shadow); }
+  .stat, .card { background: var(--card); border: 1px solid var(--border); border-radius: calc(var(--radius) + 4px); }
   .stat { padding: 20px; text-transform: capitalize; font-weight: 500; }
   .stat strong { display: block; font-size: 1.875rem; font-weight: 600; font-variant-numeric: tabular-nums; }
   .stat::before { content: ""; display: block; width: 8px; height: 8px; margin-bottom: 8px; border-radius: 99px; background: var(--tone); }
@@ -129,7 +215,9 @@ async function main() {
   .shots { display: grid; grid-template-columns: 3fr 1fr; gap: 16px; align-items: start; }
   figure { margin: 0; }
   img { width: 100%; border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); }
-  figcaption { font-size: .75rem; }
+  figcaption { font-size: .75rem; color: var(--muted-foreground); }
+  .crop { margin: 12px 0; }
+  .crop.mobile { max-width: 320px; }
   .filters { display: inline-flex; flex-wrap: wrap; gap: 3px; margin-bottom: 16px; padding: 3px; background: var(--muted); border-radius: var(--radius); }
   [hidden] { display: none !important; }
   button { min-height: 36px; padding: 4px 12px; border: 0; border-radius: calc(var(--radius) - 2px); background: transparent; color: var(--muted-foreground); font: inherit; font-weight: 500; text-transform: capitalize; cursor: pointer; }
